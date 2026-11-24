@@ -234,7 +234,7 @@ function Home() {
           </div>
 
           <h1>
-            Stories for a life
+           
             <br />
             <em>well noticed.</em>
           </h1>
