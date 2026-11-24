@@ -1,0 +1,149 @@
+
+name: Deploy React Blog to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blog-production-deployment
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # 1. Checkout GitHub repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 3. Install dependencies
+      - name: Install Dependencies
+        run: npm ci
+
+      # 4. Build React + Vite
+      - name: Build Production
+        run: npm run build
+
+      # 5. Verify production build
+      - name: Verify Build
+        run: |
+          test -f dist/index.html
+          test -d dist/assets
+          echo "Production build verified"
+
+      # 6. Configure SSH
+      - name: Configure SSH
+        env:
+          EC2_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # 7. Upload production build
+      - name: Upload Build to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "mkdir -p /home/$EC2_USER/blog-dist"
+
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/ec2_key -o StrictHostKeyChecking=yes" \
+            dist/ \
+            "$EC2_USER@$EC2_HOST:/home/$EC2_USER/blog-dist/"
+
+      # 8. Deploy to EC2
+      - name: Deploy Production Files
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo mkdir -p /var/www/BlogFront/dist"
+
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo rsync -av --delete /home/$EC2_USER/blog-dist/ /var/www/BlogFront/dist/"
+
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo chown -R ubuntu:www-data /var/www/BlogFront/dist"
+
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo find /var/www/BlogFront/dist -type d -exec chmod 755 {} \;"
+
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo find /var/www/BlogFront/dist -type f -exec chmod 644 {} \;"
+
+      # 9. Restart PM2
+      - name: Restart PM2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'if pm2 describe blog-front >/dev/null 2>&1; then
+               pm2 restart blog-front
+             else
+               pm2 serve /var/www/BlogFront/dist 4173 --spa --name blog-front
+             fi
+             pm2 save'
+
+      # 10. Reload Nginx
+      - name: Reload Nginx
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'sudo nginx -t && sudo systemctl reload nginx'
+
+      # 11. Verify website
+      - name: Verify Deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'pm2 list && curl -fsS http://127.0.0.1:4173/ >/dev/null && echo "Deployment successful"'
